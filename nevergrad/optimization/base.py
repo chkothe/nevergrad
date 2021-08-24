@@ -5,6 +5,7 @@
 
 import pickle
 import warnings
+from time import time as now
 from pathlib import Path
 from numbers import Real
 from collections import deque
@@ -79,6 +80,13 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
         number of allowed evaluations
     num_workers: int
         number of evaluations which will be run in parallel at once
+    straggler_cutoff_stds: float/None
+        an optional running time cutoff for long-running jobs ('stragglers'),
+        in standard deviations relative to recent completed runs
+    straggler_stats_fraction: float
+        the number of most recent completed runs, given as a fraction of the
+        total budget, that shall be used as the basis to determine the cutoff
+        for identifying stragglers
     """
 
     # pylint: disable=too-many-locals
@@ -90,7 +98,8 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
     hashed = False
 
     def __init__(
-        self, parametrization: IntOrParameter, budget: tp.Optional[int] = None, num_workers: int = 1
+        self, parametrization: IntOrParameter, budget: tp.Optional[int] = None, num_workers: int = 1,
+        straggler_cutoff_stds: tp.Optional[float] = None, straggler_stats_fraction: float = 0.2
     ) -> None:
         if self.no_parallelization and num_workers > 1:
             raise ValueError(f"{self.__class__.__name__} does not support parallelization")
@@ -98,6 +107,9 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
         # you can also replace or reinitialize this random state
         self.num_workers = int(num_workers)
         self.budget = budget
+
+        self.straggler_cutoff_stds = straggler_cutoff_stds
+        self.straggler_stats_fraction = straggler_stats_fraction
 
         # How do we deal with cheap constraints i.e. constraints which are fast and use low resources and easy ?
         # True ==> we penalize them (infinite values for candidates which violate the constraint).
@@ -139,8 +151,12 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
         self._num_tell_not_asked = 0
         self._callbacks: tp.Dict[str, tp.List[tp.Any]] = {}
         # to make optimize function stoppable halway through
-        self._running_jobs: tp.List[tp.Tuple[p.Parameter, tp.JobLike[tp.Loss]]] = []
+        self._running_jobs: tp.List[tp.Tuple[p.Parameter, tp.JobLike[tp.Loss], float]] = []
         self._finished_jobs: tp.Deque[tp.Tuple[p.Parameter, tp.JobLike[tp.Loss]]] = deque()
+        # any jobs we abandoned due to them taking longer than a cutoff (stragglers)
+        self._abandoned_jobs: tp.List[tp.Tuple[p.Parameter, tp.JobLike[tp.Loss], float]] = []
+        # list of running times of jobs run so far (in order of completion)
+        self._running_times: tp.List[float] = []
 
     @property
     def _rng(self) -> np.random.RandomState:
@@ -615,11 +631,32 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
                 if new_sugg:
                     sleeper.start_timer()
             remaining_budget = self.budget - self.num_ask
+
+            # calculate the running time cutoff based on stats in recent runs
+            rt_cutoff = np.inf
+            if self.straggler_cutoff_stds:
+                budget_window = int(round(self.budget * self.straggler_stats_fraction))
+                if len(self._running_times) > min(10, budget_window):
+                    rts = np.array(self._running_times[-budget_window:])
+                    # using robust stats here
+                    rt_median = np.median(rts)
+                    rt_std = np.median(np.abs(rts - rt_median)) * 1.4826  # maxent factor
+                    rt_cutoff = rt_median + rt_std * self.straggler_cutoff_stds
+
             # split (repopulate finished and runnings in only one loop to avoid
             # weird effects if job finishes in between two list comprehensions)
             tmp_runnings, tmp_finished = [], deque()
+            # bin jobs into still-running, finished, and abandoned
             for x_job in self._running_jobs:
-                (tmp_finished if x_job[1].done() else tmp_runnings).append(x_job)
+                duration = now() - x_job[2]
+                if x_job[1].done():
+                    tmp_finished.append(x_job[:2])
+                    self._running_times.append(duration)
+                elif duration < rt_cutoff:
+                    tmp_runnings.append(x_job)
+                else:
+                    self._abandoned_jobs.append(x_job)
+                    print(f"abandoned long-running job {x_job} after {duration:.1f} seconds")
             self._running_jobs, self._finished_jobs = tmp_runnings, tmp_finished
             first_iteration = False
         return self.provide_recommendation()

@@ -627,7 +627,7 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
                     print(f"Launching {new_sugg} jobs with new suggestions")
                 for _ in range(new_sugg):
                     args = self.ask()
-                    self._running_jobs.append((args, executor.submit(func, *args.args, **args.kwargs)))
+                    self._running_jobs.append((args, executor.submit(func, *args.args, **args.kwargs), now()))
                 if new_sugg:
                     sleeper.start_timer()
             remaining_budget = self.budget - self.num_ask

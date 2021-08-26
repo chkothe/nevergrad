@@ -596,7 +596,9 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
         if multiobjective:
             func = func.multiobjective_function  # type: ignore
         #
+        n_iter = 0
         while remaining_budget or self._running_jobs or self._finished_jobs:
+            n_iter += 1
             # # # # # Update optimizer with finished jobs # # # # #
             # this is the first thing to do when resuming an existing optimization run
             # process finished
@@ -642,6 +644,8 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
                     rt_median = np.median(rts)
                     rt_std = np.median(np.abs(rts - rt_median)) * 1.4826  # maxent factor
                     rt_cutoff = rt_median + rt_std * self.straggler_cutoff_stds
+                    if verbosity > 2 and n_iter % 50 == 0:
+                        print(f'running time cutoff is {rt_cutoff:.1f}s ({rt_median:.1f}s + {self.straggler_cutoff_stds:.1f}*{rt_std:.1f}s)')
 
             # split (repopulate finished and runnings in only one loop to avoid
             # weird effects if job finishes in between two list comprehensions)
@@ -649,14 +653,27 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
             # bin jobs into still-running, finished, and abandoned
             for x_job in self._running_jobs:
                 duration = now() - x_job[2]
-                if x_job[1].done():
+                if duration > rt_cutoff:
+                    # exceeded duration, try to cancel
+                    if x_job[1].cancel():
+                        print(f"successfully canceled long-running job {x_job} after {duration:.1f} seconds")
+                    elif x_job[1].done():
+                        # rare case: it's possible the job wasn't cancelable
+                        # due to it having completed just in time
+                        tmp_finished.append(x_job[:2])
+                        self._running_times.append(duration)
+                    else:
+                        # failed to cancel (eg cancellation not supported by
+                        # executor implementation) - abandon job
+                        self._abandoned_jobs.append(x_job)
+                        print(f"abandoned long-running job {x_job} after {duration:.1f} seconds")
+                elif x_job[1].done():
+                    # completed normally
                     tmp_finished.append(x_job[:2])
                     self._running_times.append(duration)
-                elif duration < rt_cutoff:
-                    tmp_runnings.append(x_job)
                 else:
-                    self._abandoned_jobs.append(x_job)
-                    print(f"abandoned long-running job {x_job} after {duration:.1f} seconds")
+                    # still running normally
+                    tmp_runnings.append(x_job)
             self._running_jobs, self._finished_jobs = tmp_runnings, tmp_finished
             first_iteration = False
         return self.provide_recommendation()

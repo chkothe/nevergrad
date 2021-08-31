@@ -609,11 +609,16 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
                     sleeper.stop_timer()
                 while self._finished_jobs:
                     x, job = self._finished_jobs[0]
-                    result = job.result()
+                    try:
+                        result = job.result()
+                    except Exception as e:
+                        print(f"got exception {e} for job {job}, ignoring")
+                        continue
+                    finally:
+                        self._finished_jobs.popleft()  # remove it after the tell to make sure it was indeed "told" (in case of interruption)
                     if multiobjective:  # hack
                         result = objective_function.compute_aggregate_loss(job.result(), *x.args, **x.kwargs)  # type: ignore
                     self.tell(x, result)
-                    self._finished_jobs.popleft()  # remove it after the tell to make sure it was indeed "told" (in case of interruption)
                     if verbosity:
                         print(f"Updating fitness with value {job.result()}")
                 if verbosity:

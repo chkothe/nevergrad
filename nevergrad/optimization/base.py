@@ -601,91 +601,94 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
             func = func.multiobjective_function  # type: ignore
         #
         n_iter = 0
-        while remaining_budget or self._running_jobs or self._finished_jobs:
-            n_iter += 1
-            # # # # # Update optimizer with finished jobs # # # # #
-            # this is the first thing to do when resuming an existing optimization run
-            # process finished
-            if self._finished_jobs:
-                if (remaining_budget or sleeper._start is not None) and not first_iteration:
-                    # ignore stop if no more suggestion is sent
-                    # this is an ugly hack to avoid warnings at the end of steady mode
-                    sleeper.stop_timer()
-                while self._finished_jobs:
-                    x, job = self._finished_jobs[0]
-                    try:
-                        result = job.result()
-                    except Exception as e:
-                        print(f"got exception {e} for job {job}, ignoring")
-                        continue
-                    finally:
-                        # make sure we clear it
-                        self._finished_jobs.popleft()
-                    if multiobjective:  # hack
-                        result = objective_function.compute_aggregate_loss(job.result(), *x.args, **x.kwargs)  # type: ignore
-                    self.tell(x, result)
+        try:
+            while remaining_budget or self._running_jobs or self._finished_jobs:
+                n_iter += 1
+                # # # # # Update optimizer with finished jobs # # # # #
+                # this is the first thing to do when resuming an existing optimization run
+                # process finished
+                if self._finished_jobs:
+                    if (remaining_budget or sleeper._start is not None) and not first_iteration:
+                        # ignore stop if no more suggestion is sent
+                        # this is an ugly hack to avoid warnings at the end of steady mode
+                        sleeper.stop_timer()
+                    while self._finished_jobs:
+                        x, job = self._finished_jobs[0]
+                        try:
+                            result = job.result()
+                        except Exception as e:
+                            print(f"got exception {e} for job {job}, ignoring")
+                            continue
+                        finally:
+                            # make sure we clear it
+                            self._finished_jobs.popleft()
+                        if multiobjective:  # hack
+                            result = objective_function.compute_aggregate_loss(job.result(), *x.args, **x.kwargs)  # type: ignore
+                        self.tell(x, result)
+                        if verbosity:
+                            print(f"Updating fitness with value {job.result()}")
                     if verbosity:
-                        print(f"Updating fitness with value {job.result()}")
-                if verbosity:
-                    print(f"{remaining_budget} remaining budget and {len(self._running_jobs)} running jobs")
-                    if verbosity > 1:
-                        print("Current pessimistic best is: {}".format(self.current_bests["pessimistic"]))
-            elif not first_iteration:
-                sleeper.sleep()
-            # # # # # Start new jobs # # # # #
-            if not batch_mode or not self._running_jobs:
-                new_sugg = max(0, min(remaining_budget, self.num_workers - len(self._running_jobs)))
-                if verbosity and new_sugg:
-                    print(f"Launching {new_sugg} jobs with new suggestions")
-                for _ in range(new_sugg):
-                    args = self.ask()
-                    self._running_jobs.append((args, executor.submit(func, *args.args, **args.kwargs), now()))
-                if new_sugg:
-                    sleeper.start_timer()
-            remaining_budget = self.budget - self.num_ask
+                        print(f"{remaining_budget} remaining budget and {len(self._running_jobs)} running jobs")
+                        if verbosity > 1:
+                            print("Current pessimistic best is: {}".format(self.current_bests["pessimistic"]))
+                elif not first_iteration:
+                    sleeper.sleep()
+                # # # # # Start new jobs # # # # #
+                if not batch_mode or not self._running_jobs:
+                    new_sugg = max(0, min(remaining_budget, self.num_workers - len(self._running_jobs)))
+                    if verbosity and new_sugg:
+                        print(f"Launching {new_sugg} jobs with new suggestions")
+                    for _ in range(new_sugg):
+                        args = self.ask()
+                        self._running_jobs.append((args, executor.submit(func, *args.args, **args.kwargs), now()))
+                    if new_sugg:
+                        sleeper.start_timer()
+                remaining_budget = self.budget - self.num_ask
 
-            # calculate the running time cutoff based on stats in recent runs
-            rt_cutoff = np.inf
-            if self.straggler_cutoff_stds:
-                budget_window = int(round(self.budget * self.straggler_stats_fraction))
-                if len(self._running_times) > min(10, budget_window):
-                    rts = np.array(self._running_times[-budget_window:])
-                    # using robust stats here
-                    rt_median = np.median(rts)
-                    rt_std = np.median(np.abs(rts - rt_median)) * 1.4826  # maxent factor
-                    rt_cutoff = rt_median + rt_std * self.straggler_cutoff_stds
-                    if verbosity > 2 and n_iter % 50 == 0:
-                        print(f'running time cutoff is {rt_cutoff:.1f}s ({rt_median:.1f}s + {self.straggler_cutoff_stds:.1f}*{rt_std:.1f}s)')
+                # calculate the running time cutoff based on stats in recent runs
+                rt_cutoff = np.inf
+                if self.straggler_cutoff_stds:
+                    budget_window = int(round(self.budget * self.straggler_stats_fraction))
+                    if len(self._running_times) > min(10, budget_window):
+                        rts = np.array(self._running_times[-budget_window:])
+                        # using robust stats here
+                        rt_median = np.median(rts)
+                        rt_std = np.median(np.abs(rts - rt_median)) * 1.4826  # maxent factor
+                        rt_cutoff = rt_median + rt_std * self.straggler_cutoff_stds
+                        if verbosity > 2 and n_iter % 50 == 0:
+                            print(f'running time cutoff is {rt_cutoff:.1f}s ({rt_median:.1f}s + {self.straggler_cutoff_stds:.1f}*{rt_std:.1f}s)')
 
-            # split (repopulate finished and runnings in only one loop to avoid
-            # weird effects if job finishes in between two list comprehensions)
-            tmp_runnings, tmp_finished = [], deque()
-            # bin jobs into still-running, finished, and abandoned
-            for x_job in self._running_jobs:
-                duration = now() - x_job[2]
-                if duration > rt_cutoff:
-                    # exceeded duration, try to cancel
-                    if self.cancel_abandoned and x_job[1].cancel():
-                        print(f"successfully canceled long-running job {x_job} after {duration:.1f} seconds")
+                # split (repopulate finished and runnings in only one loop to avoid
+                # weird effects if job finishes in between two list comprehensions)
+                tmp_runnings, tmp_finished = [], deque()
+                # bin jobs into still-running, finished, and abandoned
+                for x_job in self._running_jobs:
+                    duration = now() - x_job[2]
+                    if duration > rt_cutoff:
+                        # exceeded duration, try to cancel
+                        if self.cancel_abandoned and x_job[1].cancel():
+                            print(f"successfully canceled long-running job {x_job} after {duration:.1f} seconds")
+                        elif x_job[1].done():
+                            # rare case: it's possible the job wasn't cancelable
+                            # due to it having completed just in time
+                            tmp_finished.append(x_job[:2])
+                            self._running_times.append(duration)
+                        else:
+                            # failed to cancel (eg cancellation not supported by
+                            # executor implementation) - abandon job
+                            self._abandoned_jobs.append(x_job)
+                            print(f"abandoned long-running job {x_job} after {duration:.1f} seconds")
                     elif x_job[1].done():
-                        # rare case: it's possible the job wasn't cancelable
-                        # due to it having completed just in time
+                        # completed normally
                         tmp_finished.append(x_job[:2])
                         self._running_times.append(duration)
                     else:
-                        # failed to cancel (eg cancellation not supported by
-                        # executor implementation) - abandon job
-                        self._abandoned_jobs.append(x_job)
-                        print(f"abandoned long-running job {x_job} after {duration:.1f} seconds")
-                elif x_job[1].done():
-                    # completed normally
-                    tmp_finished.append(x_job[:2])
-                    self._running_times.append(duration)
-                else:
-                    # still running normally
-                    tmp_runnings.append(x_job)
-            self._running_jobs, self._finished_jobs = tmp_runnings, tmp_finished
-            first_iteration = False
+                        # still running normally
+                        tmp_runnings.append(x_job)
+                self._running_jobs, self._finished_jobs = tmp_runnings, tmp_finished
+                first_iteration = False
+        except KeyboardInterrupt:
+            print('Caught KeyboardInterrupt; finishing and providing recommendation...')
         return self.provide_recommendation()
 
 

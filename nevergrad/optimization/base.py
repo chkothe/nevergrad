@@ -87,6 +87,8 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
         the number of most recent completed runs, given as a fraction of the
         total budget, that shall be used as the basis to determine the cutoff
         for identifying stragglers
+    cancel_abandoned: cancel abandoned jobs (requires support from the executor
+        to work)
     """
 
     # pylint: disable=too-many-locals
@@ -99,7 +101,8 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
 
     def __init__(
         self, parametrization: IntOrParameter, budget: tp.Optional[int] = None, num_workers: int = 1,
-        straggler_cutoff_stds: tp.Optional[float] = None, straggler_stats_fraction: float = 0.2
+        straggler_cutoff_stds: tp.Optional[float] = None, straggler_stats_fraction: float = 0.2,
+        cancel_abandoned: bool = False
     ) -> None:
         if self.no_parallelization and num_workers > 1:
             raise ValueError(f"{self.__class__.__name__} does not support parallelization")
@@ -110,6 +113,7 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
 
         self.straggler_cutoff_stds = straggler_cutoff_stds
         self.straggler_stats_fraction = straggler_stats_fraction
+        self.cancel_abandoned = cancel_abandoned
 
         # How do we deal with cheap constraints i.e. constraints which are fast and use low resources and easy ?
         # True ==> we penalize them (infinite values for candidates which violate the constraint).
@@ -615,7 +619,8 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
                         print(f"got exception {e} for job {job}, ignoring")
                         continue
                     finally:
-                        self._finished_jobs.popleft()  # remove it after the tell to make sure it was indeed "told" (in case of interruption)
+                        # make sure we clear it
+                        self._finished_jobs.popleft()
                     if multiobjective:  # hack
                         result = objective_function.compute_aggregate_loss(job.result(), *x.args, **x.kwargs)  # type: ignore
                     self.tell(x, result)
@@ -660,7 +665,7 @@ class Optimizer:  # pylint: disable=too-many-instance-attributes
                 duration = now() - x_job[2]
                 if duration > rt_cutoff:
                     # exceeded duration, try to cancel
-                    if x_job[1].cancel():
+                    if self.cancel_abandoned and x_job[1].cancel():
                         print(f"successfully canceled long-running job {x_job} after {duration:.1f} seconds")
                     elif x_job[1].done():
                         # rare case: it's possible the job wasn't cancelable
